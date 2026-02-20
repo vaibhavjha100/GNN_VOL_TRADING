@@ -140,13 +140,16 @@ for month_end in monthly_dates[6:]:  # Skip first 6 months (warmup)
         .fillna(0.15)
     )
     node_features = torch.tensor(node_feat_df.values, dtype=torch.float)
+
+    ticker_order = list(G.nodes())
     
     graph_data = Data(
         x=node_features,
         edge_index=edge_index,
         edge_attr=edge_attr,
         num_nodes=G.number_of_nodes(),
-        date=str(month_end.date())  # Metadata
+        date=str(month_end.date()),  # Metadata
+        ticker_order=ticker_order
     )
     
     monthly_graphs[str(month_end.date())] = graph_data
