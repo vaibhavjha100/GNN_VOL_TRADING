@@ -20,6 +20,17 @@ from model import TemporalGAT
 
 warnings.filterwarnings('ignore')
 
+tradeable_tickers = [
+    # ETFs (40)
+    "SPY", "QQQ", "IWM", "MDY", "TLT", "IEF", "SHY", "TIP",
+    "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLK", "XLU", "XLB", "XLC", "XLRE",
+    "USO", "GLD", "SLV", "DBC", "EWJ", "EWG", "EWU", "FXI", "EEM", "EFA", "ACWX",
+    
+    # Stocks (12 mega-caps)
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+    "JPM", "XOM", "UNH", "LLY"
+]
+
 print("=== 1-YEAR GAT vs GARCH BACKTEST (2025 Full) ===")
 
 # === 1. LOAD DATA ===
