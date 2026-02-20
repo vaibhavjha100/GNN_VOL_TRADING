@@ -1,242 +1,332 @@
 """
-1-YEAR FULL BACKTEST: GAT vs GARCH vs Buy-Hold
-2025 Complete OOS + Prediction Metrics
-Your data.csv + features.csv → Sharpe + RMSE + Win Rate
+BACKTEST - 4 PORTFOLIO COMPARISON
+✅ Buy & Hold | ✅ Past Vol | ✅ GARCH | ✅ GAT
+Daily long-short strategies | Exact test period | Production metrics
 """
 
 import pandas as pd
 import numpy as np
 from arch import arch_model
-import torch
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv, global_mean_pool
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
+import pickle
 import warnings
-from model import TemporalGAT
-
 warnings.filterwarnings('ignore')
 
+print("=== 4-PORTFOLIO BACKTEST FRAMEWORK ===")
+
+# === 1. LOAD DATA & ALIGN WITH MODEL.PY ===
+features = pd.read_csv("features.csv", index_col=['Ticker', 'Date'])
+features.index = features.index.set_levels([
+    features.index.levels[0], 
+    pd.to_datetime(features.index.levels[1])
+])
+features = features.sort_index()
+
+# Get tradeable tickers
 tradeable_tickers = [
     # ETFs (40)
     "SPY", "QQQ", "IWM", "MDY", "TLT", "IEF", "SHY", "TIP",
     "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLK", "XLU", "XLB", "XLC", "XLRE",
     "USO", "GLD", "SLV", "DBC", "EWJ", "EWG", "EWU", "FXI", "EEM", "EFA", "ACWX",
     
-    # Stocks (12 mega-caps)
+    # Stocks (11 mega-caps)
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
     "JPM", "XOM", "UNH", "LLY"
 ]
+print(f"Tradeable tickers: {len(tradeable_tickers)}")
 
-print("=== 1-YEAR GAT vs GARCH BACKTEST (2025 Full) ===")
+# Load GAT results for exact test period
+with open('gat_1month_test_results.pkl', 'rb') as f:
+    gat_results = pickle.load(f)
 
-# === 1. LOAD DATA ===
-print("Loading data...")
-data = pd.read_csv('data.csv', index_col=['Ticker', 'Date'])
-data.index = data.index.set_levels([data.index.levels[0], pd.to_datetime(data.index.levels[1])])
-features = pd.read_csv('features.csv', index_col=['Ticker', 'Date'])
-features.index = features.index.set_levels([features.index.levels[0], pd.to_datetime(features.index.levels[1])])
+test_dates = pd.DatetimeIndex(gat_results['dates'])
+print(f"Test period: {test_dates[0].date()} → {test_dates[-1].date()} ({len(test_dates)} days)")
 
-# Portfolio returns (equal weight)
-# Need to unstack to wide format for pct_change to work per ticker, or group by ticker
-close_wide = data['Close'].unstack('Ticker')
-returns_wide = close_wide.pct_change().dropna(how='all')
-portfolio_returns = returns_wide.mean(axis=1)
+# === 2. EXTRACT DAILY RETURNS (Forward returns - no lookahead) ===
+returns_data = features['Returns'].unstack('Ticker')
+returns_data = returns_data.reindex(test_dates).shift(-1)  # Next day returns
 
-# Get sorted list of tickers as used in graph construction
-ALL_TICKERS = close_wide.columns.tolist()
+# === 3. GARCH ROLLING FORECASTS (with fallback) ===
+print("\n=== Computing GARCH Predictions ===")
+rv_data = features['RV'].unstack('Ticker')
+portfolio_returns = features['Returns'].groupby('Date').mean()
 
-# 2025 FULL test (252 trading days)
-test_start = '2025-01-01'
-test_end = '2025-12-31'
-test_returns = portfolio_returns[test_start:test_end].dropna()
-train_returns = portfolio_returns[:test_start].dropna()
-
-print(f"Train: {len(train_returns)} days | Test 2025: {len(test_returns)} days")
-
-if len(test_returns) == 0:
-    print("WARNING: No test data found for 2025. Adjusting test period to latest available.")
-    test_returns = portfolio_returns.tail(100)
-    train_returns = portfolio_returns.iloc[:-100]
-
-# Realized vol (21-day rolling)
-# Using annualized vol
-test_vol_actual = test_returns.rolling(21).std() * np.sqrt(252)
-
-# === 2. GARCH ROLLING FORECASTS ===
-print("\nComputing GARCH forecasts...")
-garch_forecast_vols = []
-garch_signals = []
-
-for i in range(len(test_returns)):
-    # Rolling retrain
-    train_end_idx = len(train_returns) + i
-    temp_train = portfolio_returns.iloc[:train_end_idx].dropna() * 100
+def garch_forecast_with_fallback(target_date, returns_series, fallback_rv):
+    """GARCH forecast with past vol fallback"""
+    train_returns = returns_series[returns_series.index < target_date].dropna() * 100
     
-    if len(temp_train) > 100:
-        try:
-            garch = arch_model(temp_train, vol='Garch', p=1, q=1)
-            garch_fit = garch.fit(disp='off')
-            # forecast() gives results in % (since train * 100)
-            pred_vol = np.sqrt(garch_fit.forecast(horizon=1).variance.iloc[-1, 0]) / 100
-        except:
-            pred_vol = 0.15
-            
-        # Signal logic
-        # Handle NaN for early test days
-        recent_vol_window = test_vol_actual.iloc[max(0, i-5):i+1].dropna()
-        recent_vol = recent_vol_window.mean() if not recent_vol_window.empty else 0.15
-        
-        leverage = 1.5 if pred_vol < recent_vol * 1.05 else 0.5
-        signal_ret = test_returns.iloc[i] * leverage
-        
-        garch_forecast_vols.append(pred_vol)
-        garch_signals.append(signal_ret)
-    else:
-        garch_forecast_vols.append(0.15)
-        garch_signals.append(test_returns.iloc[i])
-
-# === 3. GAT ROLLING FORECASTS ===
-print("Computing GAT forecasts...")
-graph_data = torch.load('volatility_graph.pt', weights_only=False)
-model = TemporalGAT()
-model.load_state_dict(torch.load('gat_model_best.pt', weights_only=False))
-model.eval()
-
-gat_forecast_vols = []
-gat_signals = []
-
-for i, date in enumerate(test_returns.index):
-    # Rolling features to this date
-    temp_features = features[features.index.get_level_values('Date') <= date]
+    if len(train_returns) < 100:
+        return fallback_rv
     
-    if len(temp_features) > 252:
-        # Latest node features (clipped)
-        latest = temp_features.groupby('Ticker').last()[['RV','Skew','Kurt','Vol_Proxy']]
-        # Reindex based on ALL_TICKERS to ensure graph alignment
-        latest = latest.reindex(ALL_TICKERS[:len(graph_data.x)])
-        latest = latest.ffill().fillna(0.15)
-        latest['RV'] = np.clip(latest['RV'], 0.01, 0.5)
-        
-        graph_data.x = torch.tensor(latest.values[:len(graph_data.x)], dtype=torch.float)
-        
-        with torch.no_grad():
-            pred_vol = model(graph_data).item()
-        
-        # Signal
-        recent_vol_window = test_vol_actual.iloc[max(0, i-5):i+1].dropna()
-        recent_vol = recent_vol_window.mean() if not recent_vol_window.empty else 0.15
-        
-        leverage = 1.5 if pred_vol < recent_vol * 1.05 else 0.5
-        signal_ret = test_returns.iloc[i] * leverage
-        
-        gat_forecast_vols.append(pred_vol)
-        gat_signals.append(signal_ret)
+    try:
+        model = arch_model(train_returns, vol='Garch', p=1, q=1, rescale=False)
+        res = model.fit(disp='off', show_warning=False)
+        forecast_vol = np.sqrt(res.forecast(horizon=1).variance.iloc[-1]['h.1']) / 100
+        return forecast_vol.item()
+    except:
+        return fallback_rv
+
+# Pre-compute GARCH for portfolio
+garch_portfolio_preds = {}
+for date in test_dates:
+    fallback = rv_data.loc[:date].mean(axis=1).iloc[-1] if date in rv_data.index else 0.15
+    pred = garch_forecast_with_fallback(date, portfolio_returns, fallback)
+    garch_portfolio_preds[date] = pred
+
+print(f"✓ GARCH forecasts: {len(garch_portfolio_preds)} days")
+
+# === 4. GAT PREDICTIONS (pre-loaded) ===
+gat_preds_dict = dict(zip(test_dates, gat_results['predicted_rv']))
+print(f"✓ GAT predictions: {len(gat_preds_dict)} days")
+
+# === 5. DAILY SIGNALS GENERATION ===
+def get_daily_signals(date, signal_type='past_vol'):
+    """
+    Generate signals for all tickers on given date (NO LOOKAHEAD)
+    Returns: Series with ticker signals (lower = safer = long)
+    """
+    if date not in features.index.get_level_values('Date'):
+        return pd.Series(dtype=float)
+    
+    # Get data UP TO date (previous close)
+    past_data = features[features.index.get_level_values('Date') <= date]
+    
+    if signal_type == 'past_vol':
+        # Today's realized vol
+        signals = past_data.groupby('Ticker')['RV'].last()
+    
+    elif signal_type == 'garch':
+        # Per-ticker GARCH (expensive, so use portfolio GARCH + relative RV)
+        portfolio_garch = garch_portfolio_preds.get(date, 0.15)
+        current_rv = past_data.groupby('Ticker')['RV'].last()
+        # Scale by relative vol to portfolio
+        signals = current_rv * (portfolio_garch / current_rv.mean())
+    
+    elif signal_type == 'gat':
+        # GAT portfolio pred scaled by ticker RV
+        gat_pred = gat_preds_dict.get(date, 0.15)
+        current_rv = past_data.groupby('Ticker')['RV'].last()
+        signals = current_rv * (gat_pred / current_rv.mean())
+    
+    return signals.dropna()
+
+# === 6. PORTFOLIO CONSTRUCTION ===
+def construct_long_short_portfolio(signals, available_tickers):
+    """
+    Long bottom 50% (low vol), Short top 50% (high vol)
+    Equal weight within long/short legs
+    """
+    if len(signals) < 2:
+        return pd.Series(dtype=float)
+    
+    # Filter to available tickers
+    signals = signals[signals.index.isin(available_tickers)]
+    
+    # Rank and split
+    n_half = len(signals) // 2
+    sorted_tickers = signals.sort_values().index
+    
+    long_tickers = sorted_tickers[:n_half]
+    short_tickers = sorted_tickers[-n_half:]
+    
+    # Equal weight
+    weights = pd.Series(0.0, index=signals.index)
+    weights.loc[long_tickers] = 1.0 / len(long_tickers)
+    weights.loc[short_tickers] = -1.0 / len(short_tickers)
+    
+    return weights
+
+# === 7. DAILY BACKTESTING ENGINE ===
+print("\n=== Running Backtest ===")
+
+portfolios = {
+    'buy_hold': [],
+    'past_vol': [],
+    'garch': [],
+    'gat': []
+}
+
+weights_history = {k: [] for k in portfolios.keys()}
+tx_costs = 0.001  # 10bps per trade
+
+for i, date in enumerate(test_dates[:-1]):  # Exclude last (no forward return)
+    
+    # Get available tickers and returns for NEXT day
+    next_date = test_dates[i + 1]
+    if next_date not in returns_data.index:
+        continue
+    
+    daily_returns = returns_data.loc[next_date].dropna()
+    available_tickers = daily_returns.index.tolist()
+    
+    if len(available_tickers) < 10:  # Skip if too few tickers
+        continue
+    
+    # === PORTFOLIO 1: BUY & HOLD ===
+    buy_hold_weights = pd.Series(1.0 / len(available_tickers), index=available_tickers)
+    buy_hold_ret = (buy_hold_weights * daily_returns).sum()
+    portfolios['buy_hold'].append(buy_hold_ret)
+    weights_history['buy_hold'].append(buy_hold_weights)
+    
+    # === PORTFOLIO 2: PAST VOL ===
+    past_signals = get_daily_signals(date, 'past_vol')
+    past_weights = construct_long_short_portfolio(past_signals, available_tickers)
+    
+    if not past_weights.empty:
+        past_ret = (past_weights * daily_returns).sum()
+        # Transaction costs (turnover)
+        if i > 0:
+            prev_weights = weights_history['past_vol'][-1].reindex(past_weights.index, fill_value=0)
+            turnover = (past_weights - prev_weights).abs().sum()
+            past_ret -= turnover * tx_costs
+        portfolios['past_vol'].append(past_ret)
+        weights_history['past_vol'].append(past_weights)
     else:
-        gat_forecast_vols.append(0.15)
-        gat_signals.append(test_returns.iloc[i])
+        portfolios['past_vol'].append(0.0)
+        weights_history['past_vol'].append(pd.Series(dtype=float))
+    
+    # === PORTFOLIO 3: GARCH ===
+    garch_signals = get_daily_signals(date, 'garch')
+    garch_weights = construct_long_short_portfolio(garch_signals, available_tickers)
+    
+    if not garch_weights.empty:
+        garch_ret = (garch_weights * daily_returns).sum()
+        if i > 0:
+            prev_weights = weights_history['garch'][-1].reindex(garch_weights.index, fill_value=0)
+            turnover = (garch_weights - prev_weights).abs().sum()
+            garch_ret -= turnover * tx_costs
+        portfolios['garch'].append(garch_ret)
+        weights_history['garch'].append(garch_weights)
+    else:
+        portfolios['garch'].append(0.0)
+        weights_history['garch'].append(pd.Series(dtype=float))
+    
+    # === PORTFOLIO 4: GAT ===
+    gat_signals = get_daily_signals(date, 'gat')
+    gat_weights = construct_long_short_portfolio(gat_signals, available_tickers)
+    
+    if not gat_weights.empty:
+        gat_ret = (gat_weights * daily_returns).sum()
+        if i > 0:
+            prev_weights = weights_history['gat'][-1].reindex(gat_weights.index, fill_value=0)
+            turnover = (gat_weights - prev_weights).abs().sum()
+            gat_ret -= turnover * tx_costs
+        portfolios['gat'].append(gat_ret)
+        weights_history['gat'].append(gat_weights)
+    else:
+        portfolios['gat'].append(0.0)
+        weights_history['gat'].append(pd.Series(dtype=float))
 
-# Truncate to match lengths
-min_len = min(len(garch_signals), len(gat_signals), len(test_returns))
-garch_signals = garch_signals[:min_len]
-gat_signals = gat_signals[:min_len]
-test_returns_bt = test_returns.iloc[:min_len]
-test_vol_actual_bt = test_vol_actual.iloc[:min_len]
-garch_forecast_vols = garch_forecast_vols[:min_len]
-gat_forecast_vols = gat_forecast_vols[:min_len]
+print(f"✓ Backtest complete: {len(portfolios['buy_hold'])} days")
 
-# === 4. PERFORMANCE METRICS ===
-def calc_metrics(returns):
-    sharpe = returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0
-    cum_ret = (1 + returns).prod() - 1
-    # Max Drawdown from returns series
-    cum_pnl = (1 + returns).cumprod()
-    max_dd = (cum_pnl.cummax() - cum_pnl).max() / cum_pnl.cummax().max() if not cum_pnl.empty else 0
+# === 8. PERFORMANCE METRICS ===
+def calculate_metrics(returns_series):
+    """Comprehensive performance metrics"""
+    returns = np.array(returns_series)
+    
+    # Cumulative
+    cum_returns = (1 + returns).cumprod()
+    total_return = cum_returns[-1] - 1
+    
+    # Annualized
+    n_days = len(returns)
+    ann_return = (1 + total_return) ** (252 / n_days) - 1
+    ann_vol = returns.std() * np.sqrt(252)
+    
+    # Risk-adjusted
+    sharpe = ann_return / ann_vol if ann_vol > 0 else 0
+    sortino = ann_return / (returns[returns < 0].std() * np.sqrt(252)) if len(returns[returns < 0]) > 0 else 0
+    
+    # Drawdown
+    cum_max = np.maximum.accumulate(cum_returns)
+    drawdown = (cum_returns - cum_max) / cum_max
+    max_dd = drawdown.min()
+    calmar = ann_return / abs(max_dd) if max_dd != 0 else 0
+    
+    # Win stats
     win_rate = (returns > 0).mean()
-    return sharpe, cum_ret, max_dd, win_rate
+    avg_win = returns[returns > 0].mean() if len(returns[returns > 0]) > 0 else 0
+    avg_loss = returns[returns < 0].mean() if len(returns[returns < 0]) > 0 else 0
+    
+    return {
+        'Total Return': total_return,
+        'Ann. Return': ann_return,
+        'Ann. Vol': ann_vol,
+        'Sharpe': sharpe,
+        'Sortino': sortino,
+        'Max DD': max_dd,
+        'Calmar': calmar,
+        'Win Rate': win_rate,
+        'Avg Win': avg_win,
+        'Avg Loss': avg_loss
+    }
 
-bh_sharpe, bh_cum, bh_dd, bh_wr = calc_metrics(test_returns_bt)
-garch_sharpe, garch_cum, garch_dd, garch_wr = calc_metrics(pd.Series(garch_signals))
-gat_sharpe, gat_cum, gat_dd, gat_wr = calc_metrics(pd.Series(gat_signals))
-
-# Vol prediction accuracy (Drop NaNs from rolling actual vol)
-valid_mask = ~np.isnan(test_vol_actual_bt.values)
-actual_valid = test_vol_actual_bt.values[valid_mask]
-garch_pred_valid = np.array(garch_forecast_vols)[valid_mask]
-gat_pred_valid = np.array(gat_forecast_vols)[valid_mask]
-
-if len(actual_valid) > 0:
-    garch_vol_rmse = np.sqrt(mean_squared_error(actual_valid, garch_pred_valid))
-    garch_vol_mae = mean_absolute_error(actual_valid, garch_pred_valid)
-    gat_vol_rmse = np.sqrt(mean_squared_error(actual_valid, gat_pred_valid))
-    gat_vol_mae = mean_absolute_error(actual_valid, gat_pred_valid)
-else:
-    garch_vol_rmse = gat_vol_rmse = 0
-
-# === 5. RESULTS TABLE ===
 print("\n" + "="*80)
-print("2025 FULL YEAR BACKTEST RESULTS")
+print("PERFORMANCE COMPARISON")
 print("="*80)
-print(f"{'Strategy':<12} {'Sharpe':<8} {'CumRet':<8} {'MaxDD':<8} {'Win%':<6} {'VolRMSE':<8}")
-print("-"*80)
-print(f"{'Buy&Hold':<12} {bh_sharpe:<8.2f} {bh_cum:<8.1%} {bh_dd:<8.1%} {bh_wr:<6.1%} {'-':<8}")
-print(f"{'GARCH':<12} {garch_sharpe:<8.2f} {garch_cum:<8.1%} {garch_dd:<8.1%} {garch_wr:<6.1%} {garch_vol_rmse:<8.3f}")
-print(f"{'GAT':<12} {gat_sharpe:<8.2f} {gat_cum:<8.1%} {gat_dd:<8.1%} {gat_wr:<6.1%} {gat_vol_rmse:<8.3f}")
-print("-"*80)
 
-gat_vs_garch = "GAT" if gat_sharpe > garch_sharpe else "GARCH"
-print(f"🏆 TRADING WINNER: {gat_vs_garch}")
-vol_win = "GAT" if gat_vol_rmse < garch_vol_rmse else "GARCH"
-print(f"🏆 VOL PRED WINNER: {vol_win}")
+metrics_df = pd.DataFrame()
+for name, rets in portfolios.items():
+    metrics = calculate_metrics(rets)
+    metrics_df[name.upper().replace('_', ' ')] = pd.Series(metrics)
 
-# === 6. PLOTS ===
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+print(metrics_df.to_string(float_format=lambda x: f'{x:.4f}'))
 
-# Cum returns
-cum_gat = (1 + pd.Series(gat_signals)).cumprod() - 1
-cum_garch = (1 + pd.Series(garch_signals)).cumprod() - 1
-cum_bh = (1 + test_returns_bt.values).cumprod() - 1
-axes[0,0].plot(cum_gat.values, label=f'GAT (Sharpe {gat_sharpe:.2f})', linewidth=2)
-axes[0,0].plot(cum_garch.values, label=f'GARCH (Sharpe {garch_sharpe:.2f})')
-axes[0,0].plot(cum_bh, label='Buy & Hold')
-axes[0,0].set_title('Cumulative Returns (2025 Full Year)')
-axes[0,0].legend()
-axes[0,0].grid()
+# === 9. VISUALIZATION ===
+fig, axes = plt.subplots(2, 2, figsize=(18, 12))
 
-# Daily returns vs signals
-axes[0,1].plot(range(len(test_returns_bt)), test_returns_bt.values, alpha=0.6, label='Returns')
-axes[0,1].scatter(range(len(gat_signals)), gat_signals, c='green', s=20, label='GAT Signals', alpha=0.7)
-axes[0,1].set_title('GAT Signals vs Actual Returns')
-axes[0,1].legend()
+# Equity curves
+axes[0, 0].plot((1 + np.array(portfolios['buy_hold'])).cumprod(), label='Buy & Hold', linewidth=2)
+axes[0, 0].plot((1 + np.array(portfolios['past_vol'])).cumprod(), label='Past Vol', linewidth=2)
+axes[0, 0].plot((1 + np.array(portfolios['garch'])).cumprod(), label='GARCH', linewidth=2)
+axes[0, 0].plot((1 + np.array(portfolios['gat'])).cumprod(), label='GAT', linewidth=3)
+axes[0, 0].set_title('Cumulative Returns', fontsize=14, fontweight='bold')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
 
-# Rolling Sharpe
-rolling_gat = pd.Series(gat_signals).rolling(21).apply(
-    lambda x: x.mean()/x.std()*np.sqrt(252) if len(x)>0 and x.std()>0 else 0
-)
-rolling_garch = pd.Series(garch_signals).rolling(21).apply(
-    lambda x: x.mean()/x.std()*np.sqrt(252) if len(x)>0 and x.std()>0 else 0
-)
-axes[1,0].plot(rolling_gat.values, label='GAT', linewidth=2)
-axes[1,0].plot(rolling_garch.values, label='GARCH')
-axes[1,0].axhline(gat_sharpe, color='green', linestyle='--')
-axes[1,0].set_title('21-Day Rolling Sharpe')
-axes[1,0].legend()
+# Sharpe comparison
+sharpes = [metrics_df.loc['Sharpe', col] for col in metrics_df.columns]
+axes[0, 1].bar(metrics_df.columns, sharpes, color=['gray', 'blue', 'orange', 'green'])
+axes[0, 1].set_title('Sharpe Ratios', fontsize=14, fontweight='bold')
+axes[0, 1].axhline(0, color='r', linestyle='--')
+axes[0, 1].grid(True, alpha=0.3, axis='y')
 
-# Vol prediction accuracy
-axes[1,1].scatter(garch_forecast_vols, test_vol_actual_bt.values, alpha=0.6, label='GARCH')
-axes[1,1].scatter(gat_forecast_vols, test_vol_actual_bt.values, alpha=0.6, label='GAT')
-axes[1,1].plot([0,0.6], [0,0.6], 'k--', label='Perfect')
-axes[1,1].set_xlabel('Predicted Vol')
-axes[1,1].set_ylabel('Actual Vol')
-axes[1,1].set_title('Vol Prediction Accuracy')
-axes[1,1].legend()
+# Drawdown comparison
+for name in portfolios.keys():
+    cum = (1 + np.array(portfolios[name])).cumprod()
+    cum_max = np.maximum.accumulate(cum)
+    dd = (cum - cum_max) / cum_max
+    axes[1, 0].plot(dd, label=name.replace('_', ' ').title(), alpha=0.8)
+axes[1, 0].set_title('Drawdowns', fontsize=14, fontweight='bold')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# Return distribution
+axes[1, 1].hist(portfolios['buy_hold'], bins=30, alpha=0.5, label='Buy Hold', density=True)
+axes[1, 1].hist(portfolios['past_vol'], bins=30, alpha=0.5, label='Past Vol', density=True)
+axes[1, 1].hist(portfolios['garch'], bins=30, alpha=0.5, label='GARCH', density=True)
+axes[1, 1].hist(portfolios['gat'], bins=30, alpha=0.5, label='GAT', density=True)
+axes[1, 1].set_title('Return Distributions', fontsize=14, fontweight='bold')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3, axis='y')
 
 plt.tight_layout()
-plt.savefig('1year_full_backtest.png', dpi=300, bbox_inches='tight')
+plt.savefig('backtest_4portfolios.png', dpi=300, bbox_inches='tight')
 plt.show()
 
-print("\n✅ 1-YEAR BACKTEST COMPLETE!")
-print("Saved: 1year_full_backtest.png")
+# === 10. SAVE RESULTS ===
+backtest_results = {
+    'portfolios': portfolios,
+    'metrics': metrics_df.to_dict(),
+    'test_dates': test_dates.tolist(),
+    'tx_costs': tx_costs
+}
+
+with open('backtest_results.pkl', 'wb') as f:
+    pickle.dump(backtest_results, f)
+
+print("\n🎉 BACKTEST COMPLETE!")
+print("Files generated:")
+print("  backtest_4portfolios.png (performance dashboard)")
+print("  backtest_results.pkl (full results)")
+print("\n✅ Production ready!")
