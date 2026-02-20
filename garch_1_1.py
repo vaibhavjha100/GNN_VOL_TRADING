@@ -1,119 +1,162 @@
 """
-GARCH(1,1) vs GAT Benchmark - FULLY FIXED
-No errors, real predictions, ticker names preserved
+GARCH(1,1) Benchmark - PERFECTLY ALIGNED WITH model.py
+✅ Exact same splits/dates/targets/scaler | ✅ Rolling OOS | ✅ Production ready
 """
 
-import torch
-import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 from arch import arch_model
-import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
-from model import TemporalGAT
+import matplotlib.pyplot as plt
+import pickle
+import warnings
+warnings.filterwarnings('ignore')
 
-# === YOUR TICKERS LIST (From graph construction) ===
-TICKERS = ['SPY', 'QQQ', 'AAPL', 'NVDA', ...]  # Paste your 102 tickers here
-# Or load from features:
+print("=== GARCH(1,1) vs GAT - EXACT MATCH ===")
+
+# === 1. LOAD IDENTICAL DATA ===
 features = pd.read_csv("features.csv", index_col=['Ticker', 'Date'])
-TICKERS = features.index.get_level_values('Ticker').unique().tolist()
-print(f"Tickers loaded: {len(TICKERS)}")
+features.index = features.index.set_levels([features.index.levels[0], pd.to_datetime(features.index.levels[1])])
+features = features.sort_index()
 
-# === 1. GARCH BENCHMARK ===
-print("=== GARCH(1,1) Benchmark ===")
-returns_wide = features['Returns'].unstack('Ticker').dropna()
-portfolio_returns = returns_wide.mean(axis=1)  # Equal-weight
+# EXACT SAME TARGET CREATION
+rv_wide = features['RV'].unstack('Ticker').dropna()
+targets = rv_wide.shift(-1).mean(axis=1).dropna()  # Next-day portfolio mean RV
+print(f"Targets: {len(targets)} days (μ={targets.mean():.4f}, σ={targets.std():.4f})")
 
-# Train/test split
-train_size = int(0.8 * len(portfolio_returns))
-train_ret = portfolio_returns.iloc[:train_size].dropna() * 100
+# === 2. EXACT SAME SPLITS ===
+train_end = pd.Timestamp('2024-01-01')
+val_end = pd.Timestamp('2024-12-01')      # Matches your model.py
+test_start = pd.Timestamp('2024-12-01')
 
-garch = arch_model(train_ret, vol='Garch', p=1, q=1)
-garch_fit = garch.fit(disp='off')
+train_mask = targets.index < train_end
+val_mask = (targets.index >= train_end) & (targets.index < val_end)
+test_mask = targets.index >= test_start
 
-# Rolling OOS forecasts
-test_ret = portfolio_returns.iloc[train_size:].dropna()
-garch_forecasts = []
-garch_actuals = test_ret.rolling(21).std() * np.sqrt(252) * 100  # 21d RV
+train_targets, val_targets, test_targets = targets[train_mask], targets[val_mask], targets[test_mask]
+print(f"Splits: Train {len(train_targets)}d | Val {len(val_targets)}d | Test {len(test_targets)}d ✓")
 
-for i in range(50):  # Last 50 days
-    temp_train = portfolio_returns.iloc[:train_size + i].dropna() * 100
-    temp_garch = arch_model(temp_train, vol='Garch', p=1, q=1)
-    temp_fit = temp_garch.fit(disp='off')
-    pred = np.sqrt(temp_fit.forecast(horizon=1).variance.iloc[-1, 0])
-    garch_forecasts.append(pred)
+# === 3. SAME GAT RESULTS ===
+print("\n=== Loading GAT Results ===")
+with open('gat_1month_test_results.pkl', 'rb') as f:
+    gat_results = pickle.load(f)
 
-garch_rmse = np.sqrt(mean_squared_error(garch_actuals.iloc[-50:], garch_forecasts))
-garch_latest = garch_forecasts[-1]
+test_dates = np.array(gat_results['dates'])
+test_actual_scaled = np.array(gat_results['actual_scaled'])
+test_gat_scaled = np.array(gat_results['predicted_scaled'])
+test_actual_raw = np.array(gat_results['actual_rv'])
+test_gat_raw = np.array(gat_results['predicted_rv'])
 
-print(f"GARCH RMSE (last 50): {garch_rmse:.2f}%")
-print(f"GARCH Tomorrow:       {garch_latest:.2f}%")
+print(f"GAT Test: RMSE={np.sqrt(mean_squared_error(test_actual_scaled, test_gat_scaled)):.4f}, Corr={np.corrcoef(test_gat_scaled, test_actual_scaled)[0,1]:.4f}")
 
-# === 2. GAT LOADING + FIX ===
-print("\n=== GAT Predictions ===")
-graph_data = torch.load('volatility_graph.pt', weights_only=False)
+# === 4. GARCH(1,1) - IDENTICAL TEST PERIOD ===
+print("\n=== GARCH Rolling Forecasts (Same Test Period) ===")
 
-# Fix: Ticker mapping (save during graph construction)
-ticker_to_idx = {t: i for i, t in enumerate(TICKERS[:len(graph_data.x)])}
+# Portfolio returns (daily) for GARCH input
+daily_returns = features['Returns'].groupby('Date').mean()
+daily_returns = daily_returns.reindex(targets.index).fillna(0)
 
-model = TemporalGAT()
-model.load_state_dict(torch.load('gat_model_best.pt', weights_only=False))
-model.eval()
-
-# Update with latest features (positive scale)
-latest_features = features.groupby('Ticker').last()[['RV','Skew','Kurt','Vol_Proxy']]
-latest_features['RV'] = np.clip(latest_features['RV'], 0.01, 0.5)  # Vol >1%, <50%
-graph_data.x = torch.tensor(latest_features.values[:len(graph_data.x)], dtype=torch.float)
-
-with torch.no_grad():
-    # Portfolio vol
-    portfolio_pred = model(graph_data).item()
+def garch_forecast(target_date, returns_series):
+    """Single forecast for exact GAT test date"""
+    train_returns = returns_series[returns_series.index < target_date].dropna() * 100  # ARCH % scale
     
-    # Per-node vols (stock signals)
-    x1 = F.relu(model.conv1(graph_data.x, graph_data.edge_index))
-    node_vols = model.conv2(x1, graph_data.edge_index).mean(dim=1)
+    if len(train_returns) < 100:
+        return np.nan
     
-    # Top 5 high vol stocks
-    top5_idx = torch.topk(node_vols, k=5).indices
-    high_vol_stocks = [TICKERS[i] for i in top5_idx if i < len(TICKERS)]
+    try:
+        model = arch_model(train_returns, vol='Garch', p=1, q=1, rescale=False)
+        res = model.fit(disp='off', show_warning=False)
+        # 1-step ahead volatility forecast (unscaled to match RV)
+        forecast_vol = np.sqrt(res.forecast(horizon=1).variance.iloc[-1]['h.1']) / 100
+        return forecast_vol.item()
+    except:
+        return np.nan
 
-print(f"GAT Portfolio Tomorrow: {portfolio_pred*100:.2f}%")
-print(f"High Vol Stocks: {high_vol_stocks}")
+# Generate GARCH predictions for EXACT GAT test dates
+garch_preds_raw = []
+for date in test_dates:
+    pred = garch_forecast(pd.Timestamp(date), daily_returns)
+    garch_preds_raw.append(pred)
 
-# === 3. COMPARISON ===
-# Proper scale comparison
-actual_proper = features['RV'].tail(50).mean()  # Annualized RV
-print(f"Proper yesterday vol: {actual_proper*100:.2f}%")
-print(f"GAT error:    {abs(1.49/100 - actual_proper):.3f}")
-print(f"GARCH error:  {abs(1.80/100 - actual_proper):.3f}")
-print(f"GAT {'WINS' if abs(1.49/100 - actual_proper) < abs(1.80/100 - actual_proper) else 'TIES'}")
+garch_preds_raw = np.array(garch_preds_raw)
 
-winner = "GAT" if abs(portfolio_pred - actual_proper) < abs(garch_latest/100 - actual_proper) else "GARCH"
-print(f"WINNER: {winner}")
+# === 5. SAME SCALER AS GAT ===
+scaler = StandardScaler()
+scaler.fit(train_targets.values.reshape(-1, 1))  # Fit on train only!
+garch_preds_scaled = scaler.transform(garch_preds_raw.reshape(-1, 1)).flatten()
 
-# === 4. TRADING SIGNAL ===
-signal = "REDUCE" if portfolio_pred > actual_proper * 1.05 else "INCREASE"
-leverage = 0.5 if signal == "REDUCE" else 1.5
-print(f"\n🎯 TRADE SIGNAL: {signal} (Leverage {leverage}x)")
+# Align (remove any NaNs)
+valid_mask = ~np.isnan(garch_preds_scaled)
+n_valid = np.sum(valid_mask)
 
-# Plot
-plt.figure(figsize=(12,8))
-plt.subplot(2,1,1)
-plt.plot(portfolio_returns.tail(60), label='Portfolio Returns')
-plt.title('Portfolio Returns (Recent)')
-plt.legend()
+garch_valid_scaled = garch_preds_scaled[valid_mask]
+garch_valid_raw = garch_preds_raw[valid_mask]
+gat_valid_scaled = test_gat_scaled[valid_mask]
+actual_valid_scaled = test_actual_scaled[valid_mask]
+actual_valid_raw = test_actual_raw[valid_mask]
+gat_valid_raw = test_gat_raw[valid_mask]
 
-plt.subplot(2,1,2)
-plt.plot(garch_actuals.tail(30), 'b-', label='Actual Vol', alpha=0.7)
-plt.plot(garch_forecasts[-30:], 'r--', label='GARCH')
-plt.axhline(portfolio_pred*100, color='g', linestyle=':', linewidth=3, label=f'GAT: {portfolio_pred*100:.1f}%')
-plt.title('Vol Comparison')
-plt.ylabel('Annualized %')
-plt.legend()
+print(f"Valid comparisons: {n_valid}/{len(test_dates)} dates")
+
+# === 6. HEAD-TO-HEAD METRICS ===
+garch_rmse_scaled = np.sqrt(mean_squared_error(actual_valid_scaled, garch_valid_scaled))
+gat_rmse_scaled = np.sqrt(mean_squared_error(actual_valid_scaled, gat_valid_scaled))
+
+garch_rmse_raw = np.sqrt(mean_squared_error(actual_valid_raw, garch_valid_raw))
+gat_rmse_raw = np.sqrt(mean_squared_error(actual_valid_raw, gat_valid_raw))
+
+garch_corr = np.corrcoef(garch_valid_scaled, actual_valid_scaled)[0, 1]
+gat_corr = np.corrcoef(gat_valid_scaled, actual_valid_scaled)[0, 1]
+
+print("\n" + "="*60)
+print("FINAL BENCHMARK RESULTS")
+print("="*60)
+print(f"{'Metric':<20} {'GARCH':<10} {'GAT':<10} {'Winner'}")
+print("-"*60)
+print(f"{'Test RMSE (scaled)':<20} {garch_rmse_scaled:<10.4f} {gat_rmse_scaled:<10.4f} {'🟢 GAT' if gat_rmse_scaled < garch_rmse_scaled else '🔴 GARCH'}")
+print(f"{'Test RMSE (raw)':<20} {garch_rmse_raw:<10.4f} {gat_rmse_raw:<10.4f} {'🟢 GAT' if gat_rmse_raw < garch_rmse_raw else '🔴 GARCH'}")
+print(f"{'Test Corr':<20} {garch_corr:<10.4f} {gat_corr:<10.4f} {'🟢 GAT' if abs(gat_corr) > abs(garch_corr) else '🔴 GARCH'}")
+print(f"{'N samples':<20} {n_valid:<10} {n_valid:<10} {'TIE'}")
+print("="*60)
+
+# === 7. PRODUCTION VISUALIZATION ===
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# 1. Time series (exact test period)
+valid_dates = [test_dates[i] for i in range(len(valid_mask)) if valid_mask[i]]
+axes[0, 0].plot(valid_dates, actual_valid_raw, 'k-', label='Actual RV', linewidth=2)
+axes[0, 0].plot(valid_dates, garch_valid_raw, 'b--', label='GARCH', alpha=0.8)
+axes[0, 0].plot(valid_dates, gat_valid_raw, 'g:', label='GAT', linewidth=3)
+axes[0, 0].set_title('OOS Test Period - Exact Match', fontsize=14)
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+axes[0, 0].tick_params(axis='x', rotation=45)
+
+# 2-3. Scatter plots
+minv, maxv = -2, 2
+axes[0, 1].scatter(actual_valid_scaled, garch_valid_scaled, alpha=0.7, s=40, c='blue', edgecolors='white')
+axes[0, 1].plot([minv, maxv], [minv, maxv], 'r--', lw=2)
+axes[0, 1].set_title(f'GARCH vs Actual\nRMSE: {garch_rmse_scaled:.3f}')
+axes[0, 1].set_xlabel('Actual (scaled)'); axes[0, 1].set_ylabel('GARCH Pred')
+
+axes[1, 0].scatter(actual_valid_scaled, gat_valid_scaled, alpha=0.7, s=40, c='green', edgecolors='white')
+axes[1, 0].plot([minv, maxv], [minv, maxv], 'r--', lw=2)
+axes[1, 0].set_title(f'GAT vs Actual\nRMSE: {gat_rmse_scaled:.3f}')
+axes[1, 0].set_xlabel('Actual (scaled)'); axes[1, 0].set_ylabel('GAT Pred')
+
+# 4. Residuals comparison
+axes[1, 1].scatter(actual_valid_scaled, actual_valid_scaled - garch_valid_scaled, alpha=0.7, s=30, label='GARCH')
+axes[1, 1].scatter(actual_valid_scaled, actual_valid_scaled - gat_valid_scaled, alpha=0.7, s=30, label='GAT')
+axes[1, 1].axhline(0, color='r', lw=2, label='Perfect')
+axes[1, 1].set_title('Residuals (Pred - Actual)')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('garch_gat_comparison.png', dpi=300)
+plt.savefig('garch_vs_gat_exact.png', dpi=300, bbox_inches='tight')
 plt.show()
 
-print("✅ Benchmark complete! Saved: garch_gat_comparison.png")
+print("\n🎉 PERFECT BENCHMARK COMPLETE!")
+print("✅ Uses EXACT same test dates/scaler/targets as model.py")
+print("✅ Saved: garch_vs_gat_exact.png")
