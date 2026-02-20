@@ -83,6 +83,9 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
     criterion = torch.nn.MSELoss()
 
+    graph_data = graph_data.to(device)
+    train_losses, val_losses = [], []
+
     train_loader = create_time_series_data(graph_data, train_targets_scaled)
 
     best_val = float('inf')

@@ -27,25 +27,39 @@ rolling_corr = rv_pivot.rolling(window_corr).corr().dropna()
 last_date = rolling_corr.index.get_level_values(0).unique()[-1]
 corr_snapshot = rolling_corr.loc[last_date]
 
-# Extract edges: |corr| > 0.5 threshold
+# Extract edges: |corr| > 0.7 threshold
 corr_edges = []
 corr_snapshot_abs = corr_snapshot.abs()
 for i in corr_snapshot_abs.index:
     for j in corr_snapshot_abs.columns:
         if i != j:
             weight = corr_snapshot_abs.loc[i, j]
-            if weight > 0.5:
+            if weight > 0.7:
                 corr_edges.append({'source': i, 'target': j, 'weight': float(weight), 'type': 'corr'})
 
 corr_df = pd.DataFrame(corr_edges)
-print(f"Correlation edges: {len(corr_df)} (threshold 0.5)")
+print(f"Correlation edges: {len(corr_df)} (threshold 0.7)")
 
 # === STEP 2: GRANGER CAUSALITY EDGES (last 252 days) ===
 granger_edges = []
 rv_data = features['RV'].unstack('Ticker').dropna()
 rv_recent = rv_data.iloc[-252:]  # Use last 1yr of data for efficiency
 
-for i in rv_recent.columns[:10]:  # Test first 10 tickers as source (scale later)
+central_tickers = [
+    # === VOLATILITY LEADERS (10) ===
+    "^VIX",      # Fear gauge (leads everything)
+    "SPY",       # Market beta  
+    "QQQ",       # Tech beta
+    "XLE",       # Energy (oil shocks)
+    "XLK",       # Tech sector
+    "XLF",       # Financials (risk-off)
+    "CL=F",      # Oil (inflation/vol shock)
+    "TLT",       # Long bonds (flight to safety)
+    "GC=F",      # Gold (safe haven)
+    "^TNX"       # Rates (yield vol)
+]
+
+for i in central_tickers:
     for j in rv_recent.columns:
         if i != j:
             try:
