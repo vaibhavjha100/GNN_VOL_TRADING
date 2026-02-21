@@ -116,7 +116,7 @@ print(f"{'Metric':<20} {'GARCH':<10} {'GAT':<10} {'Winner'}")
 print("-"*60)
 print(f"{'Test RMSE (scaled)':<20} {garch_rmse_scaled:<10.4f} {gat_rmse_scaled:<10.4f} {'🟢 GAT' if gat_rmse_scaled < garch_rmse_scaled else '🔴 GARCH'}")
 print(f"{'Test RMSE (raw)':<20} {garch_rmse_raw:<10.4f} {gat_rmse_raw:<10.4f} {'🟢 GAT' if gat_rmse_raw < garch_rmse_raw else '🔴 GARCH'}")
-print(f"{'Test Corr':<20} {garch_corr:<10.4f} {gat_corr:<10.4f} {'🟢 GAT' if abs(gat_corr) > abs(garch_corr) else '🔴 GARCH'}")
+#print(f"{'Test Corr':<20} {garch_corr:<10.4f} {gat_corr:<10.4f} {'🟢 GAT' if abs(gat_corr) > abs(garch_corr) else '🔴 GARCH'}")
 print(f"{'N samples':<20} {n_valid:<10} {n_valid:<10} {'TIE'}")
 print("="*60)
 
