@@ -1,271 +1,272 @@
 """
-FINAL BACKTEST v2.1 - FULLY FIXED + 25% EXTREMES + FULLY INVESTED
-✅ Divergent signals | ✅ Start=1.0 | ✅ Production ready
+LONG-SHORT VOLATILITY DISPERSION BACKTEST (25%/25% QUARTILES + MARGIN)
+✅ Matches model.py test period (2024-12+) 
+✅ Returns from features.csv['Returns'] column
+✅ Tradeable tickers only for positions (10L/10S = 25%)
+✅ ABSOLUTE weights sum to 1.0 (longs=0.5 + shorts=0.5 margin)
+✅ Full return-risk metrics
 """
 
+import torch
 import pandas as pd
 import numpy as np
-from arch import arch_model
+import pickle
 import matplotlib.pyplot as plt
-import pickle 
-import warnings
-warnings.filterwarnings('ignore')
+from pathlib import Path
 
-print("=== FINAL BACKTEST v2.1 - FULLY FIXED ===")
+# === CONFIG ===
+TRADEABLE_TICKERS = [
+    "SPY", "QQQ", "IWM", "MDY", "TLT", "IEF", "SHY", "TIP", 
+    "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLK", "XLU", 
+    "XLB", "XLC", "XLRE", "USO", "GLD", "SLV", "DBC", 
+    "EWJ", "EWG", "EWU", "FXI", "EEM", "EFA", "ACWX", 
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", 
+    "TSLA", "JPM", "XOM", "UNH", "LLY"
+]
 
-# === DATA LOADING ===
+N_TRADEABLE = len(TRADEABLE_TICKERS)
+N_LONG = int(0.25 * N_TRADEABLE)   # 10 tickers (25%)
+N_SHORT = int(0.25 * N_TRADEABLE)  # 10 tickers (25%)
+
+print(f"✅ Tradeable universe: {N_TRADEABLE} tickers")
+print(f"✅ Long: {N_LONG} (25%) | Short: {N_SHORT} (25%) | ABS weights sum=1.0")
+
+# === 1. LOAD MODEL OUTPUTS ===
+print("\n=== Loading model outputs ===")
+test_results = pickle.load(open('gat_1month_test_results.pkl', 'rb'))
+dates = pd.to_datetime(test_results['dates'])
+
+# Load trained model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+exec(open('model.py').read())  # Load TemporalGAT class
+model = TemporalGAT().to(device)
+checkpoint = torch.load('gat_1month_best.pt', map_location=device, weights_only=False)
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+# Load features (contains Returns column)
 features = pd.read_csv("features.csv", index_col=['Ticker', 'Date'])
 features.index = features.index.set_levels([features.index.levels[0], pd.to_datetime(features.index.levels[1])])
 features = features.sort_index()
 
-tradeable_tickers = ["SPY", "QQQ", "IWM", "MDY", "TLT", "IEF", "SHY", "TIP", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLK", "XLU", "XLB", "XLC", "XLRE", "USO", "GLD", "SLV", "DBC", "EWJ", "EWG", "EWU", "FXI", "EEM", "EFA", "ACWX", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "XOM", "UNH", "LLY"]
-print(f"Tradeable tickers: {len(tradeable_tickers)}")
+# Filter to test dates
+test_features = features.xs(dates, level='Date', drop_level=False)
 
-with open('gat_1month_test_results.pkl', 'rb') as f:
-    gat_results = pickle.load(f)
+monthly_graphs = torch.load('monthly_graphs.pt', weights_only=False)
 
-test_dates = pd.DatetimeIndex(gat_results['dates'])
-print(f"Test period: {test_dates[0].date()} → {test_dates[-1].date()} ({len(test_dates)} days)")
+print(f"✅ Data loaded: {len(dates)} test days, {len(test_features)} obs")
 
-# === RETURNS + GARCH ===
-returns_data = features['Returns'].unstack('Ticker').reindex(test_dates).shift(-1)
-rv_data = features['RV'].unstack('Ticker')
-portfolio_returns = features['Returns'].groupby('Date').mean()
+# === 2. PER-ASSET VOLATILITY FORECASTS ===
+print("\n=== Generating per-asset DL forecasts ===")
+def get_graph_context(target_date):
+    graph_dates = sorted(monthly_graphs.keys())
+    available = [pd.Timestamp(d) for d in graph_dates if pd.Timestamp(d) < target_date]
+    return monthly_graphs[str(available[-1].date())] if available else None
 
-LOOKBACK_DAYS = 252
-garch_portfolio_preds = {}
+asset_forecasts = {}
+test_returns_wide = test_features['Returns'].unstack('Ticker').loc[:, TRADEABLE_TICKERS].dropna()
 
-for date in test_dates:
-    prior_returns = portfolio_returns[portfolio_returns.index <= date]
-    fallback_series = rv_data.loc[rv_data.index <= date].mean(axis=1)
-    fallback_rv = fallback_series.iloc[-1] if len(fallback_series) > 0 else 0.15
-    
-    train_window = prior_returns[prior_returns.index >= date - pd.Timedelta(LOOKBACK_DAYS, 'D')]
-    if len(train_window) < 100:
-        garch_portfolio_preds[date] = fallback_rv
+for date in test_returns_wide.index:
+    # Get most recent graph context (ALL tickers for features)
+    context_graph = get_graph_context(date)
+    if context_graph is None:
         continue
     
-    try:
-        train_returns = train_window.dropna() * 100
-        model = arch_model(train_returns, vol='Garch', p=1, q=1, rescale=False)
-        res = model.fit(disp='off', show_warning=False)
-        garch_portfolio_preds[date] = np.sqrt(res.forecast(horizon=1).variance.iloc[-1]['h.1']) / 100
-    except:
-        garch_portfolio_preds[date] = fallback_rv
-
-gat_preds_dict = dict(zip(test_dates, gat_results['predicted_rv']))
-
-# === FIXED DIVERGENT SIGNALS ===
-def get_daily_signals(date, signal_type='past_vol'):
-    past_data = features[features.index.get_level_values('Date') <= date]
-    current_rv = past_data.groupby('Ticker')['RV'].last()
+    # Update with recent features (all tickers, last 30 days before date)
+    recent_start = date - pd.Timedelta(days=30)
+    recent_feats = features[
+        (features.index.get_level_values('Date') >= recent_start) & 
+        (features.index.get_level_values('Date') < date)
+    ]
     
-    if signal_type == 'past_vol':
-        return current_rv
+    ticker_order = getattr(context_graph, 'ticker_order', list(range(context_graph.num_nodes)))
+    latest_feats = recent_feats.groupby('Ticker')[['RV','Skew','Kurt','Vol_Proxy']].last()
+    latest_feats = latest_feats.reindex(ticker_order).fillna(0.15)
     
-    fallback_series = rv_data.loc[rv_data.index <= date].mean(axis=1)
-    hist_portfolio_rv = fallback_series.tail(30).mean()  # 30-day dynamic mean
+    # Pad if needed
+    num_nodes = context_graph.num_nodes
+    if len(latest_feats) < num_nodes:
+        pad_rows = num_nodes - len(latest_feats)
+        pad_df = pd.DataFrame([[0.15]*4]*pad_rows, columns=['RV','Skew','Kurt','Vol_Proxy'])
+        latest_feats = pd.concat([latest_feats, pad_df])
     
-    if signal_type == 'garch':
-        portfolio_garch = garch_portfolio_preds.get(date, hist_portfolio_rv)
-        return current_rv * (portfolio_garch / hist_portfolio_rv)
+    context_graph.x = torch.tensor(latest_feats.values[:num_nodes], dtype=torch.float)
     
-    if signal_type == 'gat':
-        gat_pred = gat_preds_dict.get(date, hist_portfolio_rv)
-        return current_rv * (gat_pred / hist_portfolio_rv)
-
-# === SIGNAL VALIDATION ===
-print("\n=== Signal Validation ===")
-sample_date = test_dates[len(test_dates)//4]
-past_sig = get_daily_signals(sample_date, 'past_vol')
-garch_sig = get_daily_signals(sample_date, 'garch')
-gat_sig = get_daily_signals(sample_date, 'gat')
-
-print(f"Correlations: Past-GARCH={past_sig.corr(garch_sig):.3f}, Past-GAT={past_sig.corr(gat_sig):.3f}")
-print(f"Std: Past={past_sig.std():.4f}, GARCH={garch_sig.std():.4f}, GAT={gat_sig.std():.4f}")
-
-# === 25% FULLY INVESTED PORTFOLIO ===
-def construct_fully_invested_portfolio(signals, available_tickers):
-    if len(signals) < 8:
-        return pd.Series(dtype=float)
+    # Forward pass for node embeddings
+    with torch.no_grad():
+        x = context_graph.x.to(device)
+        edge_index = context_graph.edge_index.to(device)
+        batch = torch.zeros(context_graph.num_nodes, dtype=torch.long, device=device)
+        x = model.conv1(x, edge_index)
+        x = torch.nn.functional.elu(x)
+        x = model.conv2(x, edge_index)
+        node_embeds = torch.nn.functional.elu(x).cpu().detach()
     
-    signals = signals[signals.index.isin(available_tickers)]
-    n_signals = len(signals)
-    n_extreme = max(1, int(n_signals * 0.25))
+    # Per-asset vol forecast for TRADEABLE_TICKERS only
+    tradeable_mask = [t in TRADEABLE_TICKERS for t in ticker_order]
+    tradeable_indices = np.where(tradeable_mask)[0]
+    asset_rv = latest_feats.loc[TRADEABLE_TICKERS]['RV'].fillna(0.15).values
+    asset_embeds = node_embeds[tradeable_indices].mean(dim=1).numpy()
     
-    sorted_tickers = signals.sort_values().index
-    long_tickers = sorted_tickers[:n_extreme]
-    short_tickers = sorted_tickers[-n_extreme:]
-    
-    weights = pd.Series(0.0, index=signals.index)
-    weights.loc[long_tickers] = 0.5 / len(long_tickers)   # +50% long
-    weights.loc[short_tickers] = -0.5 / len(short_tickers)  # -50% short
-    
-    return weights
+    dl_forecasts = np.abs(asset_embeds).flatten() * 0.3 + asset_rv * 0.7
+    asset_forecasts[date] = pd.Series(dl_forecasts, index=TRADEABLE_TICKERS)
 
-# === TRANSACTION COSTS ===
-def calculate_transaction_costs(new_weights, prev_weights):
-    if prev_weights is None:
-        return 0.0
-    combined_idx = new_weights.index.union(prev_weights.index)
-    new_w = new_weights.reindex(combined_idx, fill_value=0)
-    prev_w = prev_weights.reindex(combined_idx, fill_value=0)
-    turnover = np.abs(new_w - prev_w).sum()
-    base_cost = 0.0007
-    impact_cost = 0.0003 * (turnover ** 1.5)
-    return base_cost + impact_cost
+print(f"✅ Generated {len(asset_forecasts)} days of forecasts")
 
-# === BACKTEST ENGINE ===
-print("\n=== Final Backtest (25% + Fully Invested + Start=1.0) ===")
+# === 3. LONG-SHORT STRATEGY (ABS WEIGHTS=1.0) ===
+print("\n=== Running 25%/25% backtest (margin-adjusted) ===")
+TARGET_VOL = 0.12
 
-equity_curves = {k: [1.0] for k in ['buy_hold', 'past_vol', 'garch', 'gat']}
-daily_returns_dict = {k: [] for k in equity_curves}
-weights_history = {k: [] for k in equity_curves}
-tx_costs_history = {k: [] for k in equity_curves}
+strategy_returns = []
+positions = []
 
-for i, date in enumerate(test_dates[:-1]):
-    next_date = test_dates[i + 1]
-    if next_date not in returns_data.index:
+for date in test_returns_wide.index:
+    if date not in asset_forecasts:
         continue
     
-    daily_returns = returns_data.loc[next_date].dropna()
-    available_tickers = [t for t in tradeable_tickers if t in daily_returns.index]
+    vol_forecasts = asset_forecasts[date]
+    day_returns = test_returns_wide.loc[date]
     
-    if len(available_tickers) < 10:
-        for strat in equity_curves:
-            daily_returns_dict[strat].append(0.0)
-            equity_curves[strat].append(equity_curves[strat][-1])
+    # Available returns only
+    valid_tickers = day_returns.dropna().index.intersection(TRADEABLE_TICKERS)
+    if len(valid_tickers) < N_LONG + N_SHORT:
         continue
     
-    # Buy & Hold
-    bh_weights = pd.Series(1.0 / len(available_tickers), index=available_tickers)
-    bh_ret = (bh_weights * daily_returns[available_tickers]).sum()
-    daily_returns_dict['buy_hold'].append(bh_ret)
-    equity_curves['buy_hold'].append(equity_curves['buy_hold'][-1] * (1 + bh_ret))
-    weights_history['buy_hold'].append(bh_weights)
-    tx_costs_history['buy_hold'].append(0.0)
+    valid_vols = vol_forecasts.loc[valid_tickers]
+    vol_rank = valid_vols.rank(ascending=True)
     
-    # Active strategies
-    for strat in ['past_vol', 'garch', 'gat']:
-        signals = get_daily_signals(date, strat)
-        strat_weights = construct_fully_invested_portfolio(signals, available_tickers)
-        
-        if not strat_weights.empty:
-            strat_ret_gross = (strat_weights * daily_returns[available_tickers]).sum()
-            prev_weights = weights_history[strat][-1] if i > 0 else None
-            tx_cost = calculate_transaction_costs(strat_weights, prev_weights)
-            strat_ret_net = strat_ret_gross - tx_cost
-            
-            daily_returns_dict[strat].append(strat_ret_net)
-            equity_curves[strat].append(equity_curves[strat][-1] * (1 + strat_ret_net))
-            weights_history[strat].append(strat_weights)
-            tx_costs_history[strat].append(tx_cost)
-        else:
-            daily_returns_dict[strat].append(0.0)
-            equity_curves[strat].append(equity_curves[strat][-1])
-
-print(f"✓ Backtest complete: {len(daily_returns_dict['buy_hold'])} days")
-
-# === METRICS ===
-def calculate_metrics(equity_curve, daily_rets, tx_costs):
-    eq = np.array(equity_curve)
-    rets = np.array(daily_rets)
-    total_return = eq[-1] - 1
-    n_days = len(rets)
-    ann_return = eq[-1] ** (252 / n_days) - 1
-    ann_vol = rets.std() * np.sqrt(252)
-    sharpe = ann_return / ann_vol if ann_vol > 0 else 0
-    downside = rets[rets < 0]
-    sortino = ann_return / (downside.std() * np.sqrt(252)) if len(downside) > 0 else 0
-    cum_max = np.maximum.accumulate(eq)
-    drawdown = (eq - cum_max) / cum_max
-    max_dd = drawdown.min()
-    calmar = ann_return / abs(max_dd) if max_dd != 0 else 0
-    win_rate = (rets > 0).mean()
+    # Select 25% quantiles
+    longs = vol_rank.nsmallest(N_LONG).index.tolist()
+    shorts = vol_rank.nlargest(N_SHORT).index.tolist()
     
-    return {
-        'Final Equity': eq[-1],
-        'Total Return': total_return,
-        'Ann. Return': ann_return,
-        'Ann. Vol': ann_vol,
-        'Sharpe': sharpe,
-        'Sortino': sortino,
-        'Max DD': max_dd,
-        'Calmar': calmar,
-        'Win Rate': win_rate,
-        'Total Tx': round(np.sum(tx_costs), 4),
-        'Avg Tx/Day': round(np.mean(tx_costs), 6)
-    }
+    long_rets = day_returns[longs].dropna()
+    short_rets = day_returns[shorts].dropna()
+    
+    if len(long_rets) < 3 or len(short_rets) < 3:
+        continue
+    
+    # === ABSOLUTE WEIGHTS SUM TO 1.0 ===
+    # Long side: 50% total allocation (0.5 total)
+    long_sigmas = long_rets.std(ddof=0)
+    long_weights_raw = 1 / (long_sigmas + 1e-8)
+    long_weights = long_weights_raw / long_weights_raw.sum() * 0.5  # 50% to longs
+    
+    # Short side: 50% total margin (0.5 total, shorts contribute -returns)
+    short_sigmas = short_rets.std(ddof=0)
+    short_weights_raw = 1 / (short_sigmas + 1e-8)
+    short_weights = short_weights_raw / short_weights_raw.sum() * 0.5  # 50% margin to shorts
+    
+    # Verify: abs(all weights) == 1.0
+    all_weights = np.concatenate([long_weights.values, short_weights.values])
+    print(f"{date.date()}: Long wts sum={long_weights.sum():.3f}, Short wts sum={short_weights.sum():.3f}, ABS total={np.sum(np.abs(all_weights)):.3f}")
+    
+    # Portfolio P&L
+    long_pnl = np.dot(long_rets.values, long_weights.values)
+    short_pnl = np.dot(short_rets.values, short_weights.values)  # Shorts: positive if asset falls
+    
+    port_ret = long_pnl - short_pnl  # Long gains - short gains (short_pnl >0 hurts)
+    
+    # Vol targeting on historical port vol
+    recent_rets = test_returns_wide.iloc[max(0, test_returns_wide.index.get_loc(date)-20):test_returns_wide.index.get_loc(date)]
+    hist_port_vol = recent_rets.std(ddof=0).mean() * np.sqrt(252)
+    leverage = min(TARGET_VOL / max(hist_port_vol, 0.05), 2.0)
+    
+    strategy_returns.append(port_ret * leverage)
+    positions.append({
+        'date': date, 
+        'longs': longs[:5],
+        'long_weights': dict(long_weights),
+        'shorts': shorts[:5],
+        'short_weights': dict(short_weights),
+        'n_longs': len(longs),
+        'n_shorts': len(shorts),
+        'leverage': leverage,
+        'port_ret': port_ret
+    })
 
-print("\n" + "="*100)
-print("FINAL RESULTS v2.1")
-print("="*100)
+# === 4. PERFORMANCE METRICS ===
+print("\n=== 📊 PERFORMANCE METRICS ===")
+strategy_returns = pd.Series(strategy_returns, index=[p['date'] for p in positions])
+daily_rets = np.array(strategy_returns.dropna())
 
-metrics_df = pd.DataFrame()
-for name in equity_curves.keys():
-    metrics = calculate_metrics(equity_curves[name], daily_returns_dict[name], tx_costs_history[name])
-    metrics_df[name.replace('_', ' ').title()] = pd.Series(metrics)
+annual_factor = 252
+cumprod = np.cumprod(1 + daily_rets)
+metrics = {
+    'Total Return (%)': (cumprod[-1] - 1) * 100,
+    'Annualized Return (%)': (cumprod[-1] ** (annual_factor/len(daily_rets)) - 1) * 100,
+    'Annualized Vol (%)': daily_rets.std() * np.sqrt(annual_factor) * 100,
+    'Sharpe Ratio': daily_rets.mean() / daily_rets.std() * np.sqrt(annual_factor) if daily_rets.std() > 0 else 0,
+    'Sortino Ratio': daily_rets.mean() / daily_rets[daily_rets < 0].std() * np.sqrt(annual_factor) if len(daily_rets[daily_rets < 0]) > 1 else 0,
+    'Max Drawdown (%)': ((np.maximum.accumulate(cumprod) / cumprod - 1).max()) * 100,
+    'Calmar Ratio': metrics['Annualized Return (%)'] / abs(metrics['Max Drawdown (%)']) if metrics['Max Drawdown (%)'] > 0 else np.inf,
+    'Win Rate (%)': (daily_rets > 0).mean() * 100,
+    'Profit Factor': abs(daily_rets[daily_rets > 0].sum() / daily_rets[daily_rets < 0].sum()) if len(daily_rets[daily_rets < 0]) > 0 else np.inf,
+    'N Trading Days': len(daily_rets),
+    'Period': f"{pd.Timestamp(positions[0]['date']).date()} → {pd.Timestamp(positions[-1]['date']).date()}"
+}
 
-print(metrics_df.round(4).to_string())
+metric_df = pd.DataFrame(list(metrics.items()), columns=['Metric', 'Value']).round(2)
+print(metric_df.to_string(index=False))
 
-# === VISUALIZATION (FIXED TABLE BUG) ===
-fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+# === 5. VISUALIZATION ===
+fig, axes = plt.subplots(2, 3, figsize=(20, 12))
 
-# Equity curves
-for name in equity_curves.keys():
-    axes[0, 0].semilogy(equity_curves[name], linewidth=3, label=name.replace('_', ' ').title())
-axes[0, 0].set_title('Equity Curves (Log) - Start=1.0', fontweight='bold', fontsize=14)
-axes[0, 0].legend()
-axes[0, 0].grid(True, alpha=0.3)
+# Cumulative PnL
+axes[0,0].plot(pd.Series(cumprod-1)*100, linewidth=3)
+axes[0,0].set_title(f'Cumulative Returns\nSharpe: {metrics["Sharpe Ratio"]:.2f}')
+axes[0,0].set_ylabel('Total Return (%)')
+axes[0,0].grid(alpha=0.3)
 
-# Key metrics table (FIXED column names)
-key_cols = ['Final Equity', 'Sharpe', 'Max DD', 'Total Tx']
-table_data = metrics_df[key_cols].round(4)
-axes[0, 1].axis('off')
-table = axes[0, 1].table(cellText=table_data.values, 
-                        colLabels=table_data.columns,
-                        cellLoc='center', loc='center')
-table.auto_set_font_size(False)
-table.set_fontsize(11)
-table.scale(1.2)
-axes[0, 1].set_title('Performance Summary', fontweight='bold', fontsize=14)
+# Drawdown
+dd = np.maximum.accumulate(cumprod) / cumprod - 1
+axes[0,1].fill_between(range(len(dd)), dd*100, 0, alpha=0.3, color='red')
+axes[0,1].plot(dd*100, linewidth=2)
+axes[0,1].set_title(f'Max DD: {metrics["Max Drawdown (%)"]:.1f}%')
+axes[0,1].set_ylabel('Drawdown (%)')
 
-# Drawdowns
-for name in equity_curves.keys():
-    eq = np.array(equity_curves[name])
-    cum_max = np.maximum.accumulate(eq)
-    dd = (eq - cum_max) / cum_max
-    axes[1, 0].plot(dd*100, label=name.replace('_', ' ').title())
-axes[1, 0].set_title('Drawdowns (%)', fontweight='bold', fontsize=14)
-axes[1, 0].legend()
-axes[1, 0].grid(True, alpha=0.3)
+# Returns histogram
+axes[0,2].hist(daily_rets*10000, bins=25, alpha=0.7, edgecolor='black')
+axes[0,2].axvline(daily_rets.mean()*10000, color='red', ls='--', 
+                 label=f'Mean: {daily_rets.mean()*10000:.0f}bps')
+axes[0,2].legend()
+axes[0,2].set_title('Daily Returns')
+axes[0,2].set_xlabel('bps')
 
-# Return distributions
-for name in daily_returns_dict.keys():
-    axes[1, 1].hist(daily_returns_dict[name]*100, bins=30, alpha=0.7, 
-                   label=name.replace('_', ' ').title(), density=True)
-axes[1, 1].set_title('Daily Returns (%)', fontweight='bold', fontsize=14)
-axes[1, 1].legend()
-axes[1, 1].grid(True, alpha=0.3)
+# Rolling Sharpe
+rolling_sharpe = pd.Series(daily_rets).rolling(20).apply(
+    lambda x: x.mean()/x.std()*np.sqrt(252) if x.std()>0 else 0
+)
+axes[1,0].plot(rolling_sharpe)
+axes[1,0].axhline(rolling_sharpe.mean(), color='red', ls='--')
+axes[1,0].set_title('20-Day Rolling Sharpe')
+
+# Weight concentration (avg abs weight per side)
+avg_long_wt = np.mean([np.mean(list(p['long_weights'].values())) for p in positions])
+avg_short_wt = np.mean([np.mean(list(p['short_weights'].values())) for p in positions])
+axes[1,1].pie([0.5, 0.5], labels=['Long Allocation (50%)', 'Short Margin (50%)'], autopct='%1.0f%%')
+axes[1,1].set_title(f'Avg Weights: L={avg_long_wt:.1%}/ticker, S={avg_short_wt:.1%}/ticker')
+
+# Ticker frequency
+all_longs = pd.Series([t for p in positions for t in p['longs']]).value_counts()
+all_shorts = pd.Series([t for p in positions for t in p['shorts']]).value_counts()
+top10 = list(set(list(all_longs.index[:5]) + list(all_shorts.index[:5])))
+axes[1,2].bar(range(len(top10)), all_longs.reindex(top10, fill_value=0).values, 
+              alpha=0.7, label='Long Days', color='green')
+axes[1,2].bar(range(len(top10)), -all_shorts.reindex(top10, fill_value=0).values, 
+              alpha=0.7, label='Short Days', color='red')
+axes[1,2].set_xticks(range(len(top10)))
+axes[1,2].set_xticklabels(top10, rotation=45)
+axes[1,2].legend()
+axes[1,2].set_title('Top Ticker Exposure')
 
 plt.tight_layout()
-plt.savefig('backtest_final_v2_1.png', dpi=300, bbox_inches='tight')
+plt.savefig('long_short_25pct_margin.png', dpi=300, bbox_inches='tight')
 plt.show()
 
 # === SAVE ===
-results = {
-    'equity_curves': equity_curves,
-    'daily_returns': daily_returns_dict,
-    'metrics': metrics_df.to_dict(),
-    'test_dates': test_dates.tolist()
-}
-
-with open('backtest_final_v2_1.pkl', 'wb') as f:
+results = {'returns': daily_rets.tolist(), 'metrics': metrics, 'positions': positions}
+with open('long_short_25pct_margin.pkl', 'wb') as f:
     pickle.dump(results, f)
 
-print("\n🎉 FINAL BACKTEST v2.1 COMPLETE!")
-print("✅ 25% extremes + 50/50 fully invested")
-print("✅ Divergent signals (std devs differ)")
-print("✅ Start=1.0 equity curves")
-print("✅ Table bug fixed")
-print("✅ Production ready")
+print("\n🎉 MARGIN-ADJUSTED 25%/25% COMPLETE!")
+print("Files: long_short_25pct_margin.png | long_short_25pct_margin.pkl")
