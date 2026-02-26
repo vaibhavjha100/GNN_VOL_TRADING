@@ -13,6 +13,8 @@ import numpy as np
 import pickle
 import matplotlib.pyplot as plt
 from pathlib import Path
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # === CONFIG ===
 TRADEABLE_TICKERS = [
@@ -38,7 +40,7 @@ dates = pd.to_datetime(test_results['dates'])
 
 # Load trained model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-exec(open('model.py').read())  # Load TemporalGAT class
+from model import TemporalGAT
 model = TemporalGAT().to(device)
 checkpoint = torch.load('gat_1month_best.pt', map_location=device, weights_only=False)
 model.load_state_dict(checkpoint['model_state_dict'])
@@ -50,7 +52,7 @@ features.index = features.index.set_levels([features.index.levels[0], pd.to_date
 features = features.sort_index()
 
 # Filter to test dates
-test_features = features.xs(dates, level='Date', drop_level=False)
+test_features = features[features.index.get_level_values('Date').isin(dates)]
 
 monthly_graphs = torch.load('monthly_graphs.pt', weights_only=False)
 
@@ -64,7 +66,7 @@ def get_graph_context(target_date):
     return monthly_graphs[str(available[-1].date())] if available else None
 
 asset_forecasts = {}
-test_returns_wide = test_features['Returns'].unstack('Ticker').loc[:, TRADEABLE_TICKERS].dropna()
+test_returns_wide = test_features['Returns'].unstack('Ticker').reindex(columns=TRADEABLE_TICKERS)
 
 for date in test_returns_wide.index:
     # Get most recent graph context (ALL tickers for features)
@@ -129,15 +131,19 @@ for date in test_returns_wide.index:
     
     # Available returns only
     valid_tickers = day_returns.dropna().index.intersection(TRADEABLE_TICKERS)
-    if len(valid_tickers) < N_LONG + N_SHORT:
+    
+    n_long = int(0.25 * len(valid_tickers))
+    n_short = int(0.25 * len(valid_tickers))
+    
+    if len(valid_tickers) < n_long + n_short or n_long < 1:
         continue
     
     valid_vols = vol_forecasts.loc[valid_tickers]
     vol_rank = valid_vols.rank(ascending=True)
     
     # Select 25% quantiles
-    longs = vol_rank.nsmallest(N_LONG).index.tolist()
-    shorts = vol_rank.nlargest(N_SHORT).index.tolist()
+    longs = vol_rank.nsmallest(n_long).index.tolist()
+    shorts = vol_rank.nlargest(n_short).index.tolist()
     
     long_rets = day_returns[longs].dropna()
     short_rets = day_returns[shorts].dropna()
@@ -147,12 +153,12 @@ for date in test_returns_wide.index:
     
     # === ABSOLUTE WEIGHTS SUM TO 1.0 ===
     # Long side: 50% total allocation (0.5 total)
-    long_sigmas = long_rets.std(ddof=0)
+    long_sigmas = valid_vols.loc[long_rets.index]
     long_weights_raw = 1 / (long_sigmas + 1e-8)
     long_weights = long_weights_raw / long_weights_raw.sum() * 0.5  # 50% to longs
     
     # Short side: 50% total margin (0.5 total, shorts contribute -returns)
-    short_sigmas = short_rets.std(ddof=0)
+    short_sigmas = valid_vols.loc[short_rets.index]
     short_weights_raw = 1 / (short_sigmas + 1e-8)
     short_weights = short_weights_raw / short_weights_raw.sum() * 0.5  # 50% margin to shorts
     
@@ -198,12 +204,16 @@ metrics = {
     'Sharpe Ratio': daily_rets.mean() / daily_rets.std() * np.sqrt(annual_factor) if daily_rets.std() > 0 else 0,
     'Sortino Ratio': daily_rets.mean() / daily_rets[daily_rets < 0].std() * np.sqrt(annual_factor) if len(daily_rets[daily_rets < 0]) > 1 else 0,
     'Max Drawdown (%)': ((np.maximum.accumulate(cumprod) / cumprod - 1).max()) * 100,
-    'Calmar Ratio': metrics['Annualized Return (%)'] / abs(metrics['Max Drawdown (%)']) if metrics['Max Drawdown (%)'] > 0 else np.inf,
     'Win Rate (%)': (daily_rets > 0).mean() * 100,
     'Profit Factor': abs(daily_rets[daily_rets > 0].sum() / daily_rets[daily_rets < 0].sum()) if len(daily_rets[daily_rets < 0]) > 0 else np.inf,
     'N Trading Days': len(daily_rets),
     'Period': f"{pd.Timestamp(positions[0]['date']).date()} → {pd.Timestamp(positions[-1]['date']).date()}"
 }
+metrics['Calmar Ratio'] = metrics['Annualized Return (%)'] / abs(metrics['Max Drawdown (%)']) if metrics['Max Drawdown (%)'] > 0 else np.inf
+
+# Reorder metrics to keep Calmar Ratio with the others
+metrics = {k: metrics[k] for k in ['Total Return (%)', 'Annualized Return (%)', 'Annualized Vol (%)', 'Sharpe Ratio', 'Sortino Ratio', 'Max Drawdown (%)', 'Calmar Ratio', 'Win Rate (%)', 'Profit Factor', 'N Trading Days', 'Period']}
+
 
 metric_df = pd.DataFrame(list(metrics.items()), columns=['Metric', 'Value']).round(2)
 print(metric_df.to_string(index=False))
@@ -261,7 +271,7 @@ axes[1,2].set_title('Top Ticker Exposure')
 
 plt.tight_layout()
 plt.savefig('long_short_25pct_margin.png', dpi=300, bbox_inches='tight')
-plt.show()
+# plt.show()
 
 # === SAVE ===
 results = {'returns': daily_rets.tolist(), 'metrics': metrics, 'positions': positions}
