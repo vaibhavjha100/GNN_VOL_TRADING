@@ -27,11 +27,11 @@ TRADEABLE_TICKERS = [
 ]
 
 N_TRADEABLE = len(TRADEABLE_TICKERS)
-N_LONG = int(0.25 * N_TRADEABLE)   # 10 tickers (25%)
-N_SHORT = int(0.25 * N_TRADEABLE)  # 10 tickers (25%)
+N_LONG = int(0.5 * N_TRADEABLE)   # 10 tickers (25%)
+N_SHORT = int(0.5 * N_TRADEABLE)  # 10 tickers (25%)
 
 print(f"✅ Tradeable universe: {N_TRADEABLE} tickers")
-print(f"✅ Long: {N_LONG} (25%) | Short: {N_SHORT} (25%) | ABS weights sum=1.0")
+print(f"✅ Long: {N_LONG} (50%) | Short: {N_SHORT} (50%) | ABS weights sum=1.0")
 
 # === 1. LOAD MODEL OUTPUTS ===
 print("\n=== Loading model outputs ===")
@@ -132,8 +132,8 @@ for date in test_returns_wide.index:
     # Available returns only
     valid_tickers = day_returns.dropna().index.intersection(TRADEABLE_TICKERS)
     
-    n_long = int(0.25 * len(valid_tickers))
-    n_short = int(0.25 * len(valid_tickers))
+    n_long = int(0.5 * len(valid_tickers))
+    n_short = int(0.5 * len(valid_tickers))
     
     if len(valid_tickers) < n_long + n_short or n_long < 1:
         continue
@@ -141,9 +141,10 @@ for date in test_returns_wide.index:
     valid_vols = vol_forecasts.loc[valid_tickers]
     vol_rank = valid_vols.rank(ascending=True)
     
-    # Select 25% quantiles
-    longs = vol_rank.nsmallest(n_long).index.tolist()
-    shorts = vol_rank.nlargest(n_short).index.tolist()
+    # Select 50% quantiles
+    longs = vol_rank.nsmallest(n_long).index.tolist()      # High vol SHORT
+    shorts = vol_rank.nlargest(n_short).index.tolist()   # Low vol LONG
+
     
     long_rets = day_returns[longs].dropna()
     short_rets = day_returns[shorts].dropna()
@@ -162,15 +163,12 @@ for date in test_returns_wide.index:
     short_weights_raw = 1 / (short_sigmas + 1e-8)
     short_weights = short_weights_raw / short_weights_raw.sum() * 0.5  # 50% margin to shorts
     
-    # Verify: abs(all weights) == 1.0
-    all_weights = np.concatenate([long_weights.values, short_weights.values])
-    print(f"{date.date()}: Long wts sum={long_weights.sum():.3f}, Short wts sum={short_weights.sum():.3f}, ABS total={np.sum(np.abs(all_weights)):.3f}")
-    
     # Portfolio P&L
     long_pnl = np.dot(long_rets.values, long_weights.values)
-    short_pnl = np.dot(short_rets.values, short_weights.values)  # Shorts: positive if asset falls
+    short_pnl = np.dot(short_rets.values, -short_weights.values)  # Short returns are negative of asset returns
     
-    port_ret = long_pnl - short_pnl  # Long gains - short gains (short_pnl >0 hurts)
+    # CORRECTED: When shorts gain (asset falls), short_pnl is positive and adds to portfolio return
+    port_ret = long_pnl + short_pnl
     
     # Vol targeting on historical port vol
     recent_rets = test_returns_wide.iloc[max(0, test_returns_wide.index.get_loc(date)-20):test_returns_wide.index.get_loc(date)]
@@ -197,23 +195,31 @@ daily_rets = np.array(strategy_returns.dropna())
 
 annual_factor = 252
 cumprod = np.cumprod(1 + daily_rets)
+
+# Calculate metrics
+total_return = (cumprod[-1] - 1) * 100
+ann_return = (cumprod[-1] ** (annual_factor/len(daily_rets)) - 1) * 100
+ann_vol = daily_rets.std() * np.sqrt(annual_factor) * 100
+sharpe = (daily_rets.mean() - 0.0425 / annual_factor) / daily_rets.std() * np.sqrt(annual_factor) if daily_rets.std() > 0 else 0
+sortino = (daily_rets.mean() - 0.0425 / annual_factor) / daily_rets[daily_rets < 0].std() * np.sqrt(annual_factor) if len(daily_rets[daily_rets < 0]) > 1 else 0
+max_dd = ((np.maximum.accumulate(cumprod) / cumprod - 1).max()) * 100
+win_rate = (daily_rets > 0).mean() * 100
+profit_factor = abs(daily_rets[daily_rets > 0].sum() / daily_rets[daily_rets < 0].sum()) if len(daily_rets[daily_rets < 0]) > 0 else np.inf
+calmar = ann_return / max_dd if max_dd > 0 else np.inf
+
 metrics = {
-    'Total Return (%)': (cumprod[-1] - 1) * 100,
-    'Annualized Return (%)': (cumprod[-1] ** (annual_factor/len(daily_rets)) - 1) * 100,
-    'Annualized Vol (%)': daily_rets.std() * np.sqrt(annual_factor) * 100,
-    'Sharpe Ratio': daily_rets.mean() / daily_rets.std() * np.sqrt(annual_factor) if daily_rets.std() > 0 else 0,
-    'Sortino Ratio': daily_rets.mean() / daily_rets[daily_rets < 0].std() * np.sqrt(annual_factor) if len(daily_rets[daily_rets < 0]) > 1 else 0,
-    'Max Drawdown (%)': ((np.maximum.accumulate(cumprod) / cumprod - 1).max()) * 100,
-    'Win Rate (%)': (daily_rets > 0).mean() * 100,
-    'Profit Factor': abs(daily_rets[daily_rets > 0].sum() / daily_rets[daily_rets < 0].sum()) if len(daily_rets[daily_rets < 0]) > 0 else np.inf,
+    'Total Return (%)': total_return,
+    'Annualized Return (%)': ann_return,
+    'Annualized Vol (%)': ann_vol,
+    'Sharpe Ratio': sharpe,
+    'Sortino Ratio': sortino,
+    'Max Drawdown (%)': max_dd,
+    'Calmar Ratio': calmar,
+    'Win Rate (%)': win_rate,
+    'Profit Factor': profit_factor,
     'N Trading Days': len(daily_rets),
     'Period': f"{pd.Timestamp(positions[0]['date']).date()} → {pd.Timestamp(positions[-1]['date']).date()}"
 }
-metrics['Calmar Ratio'] = metrics['Annualized Return (%)'] / abs(metrics['Max Drawdown (%)']) if metrics['Max Drawdown (%)'] > 0 else np.inf
-
-# Reorder metrics to keep Calmar Ratio with the others
-metrics = {k: metrics[k] for k in ['Total Return (%)', 'Annualized Return (%)', 'Annualized Vol (%)', 'Sharpe Ratio', 'Sortino Ratio', 'Max Drawdown (%)', 'Calmar Ratio', 'Win Rate (%)', 'Profit Factor', 'N Trading Days', 'Period']}
-
 
 metric_df = pd.DataFrame(list(metrics.items()), columns=['Metric', 'Value']).round(2)
 print(metric_df.to_string(index=False))
@@ -223,7 +229,7 @@ fig, axes = plt.subplots(2, 3, figsize=(20, 12))
 
 # Cumulative PnL
 axes[0,0].plot(pd.Series(cumprod-1)*100, linewidth=3)
-axes[0,0].set_title(f'Cumulative Returns\nSharpe: {metrics["Sharpe Ratio"]:.2f}')
+axes[0,0].set_title(f'Cumulative Returns\nSharpe: {sharpe:.2f}')
 axes[0,0].set_ylabel('Total Return (%)')
 axes[0,0].grid(alpha=0.3)
 
@@ -231,7 +237,7 @@ axes[0,0].grid(alpha=0.3)
 dd = np.maximum.accumulate(cumprod) / cumprod - 1
 axes[0,1].fill_between(range(len(dd)), dd*100, 0, alpha=0.3, color='red')
 axes[0,1].plot(dd*100, linewidth=2)
-axes[0,1].set_title(f'Max DD: {metrics["Max Drawdown (%)"]:.1f}%')
+axes[0,1].set_title(f'Max DD: {max_dd:.1f}%')
 axes[0,1].set_ylabel('Drawdown (%)')
 
 # Returns histogram
@@ -244,7 +250,7 @@ axes[0,2].set_xlabel('bps')
 
 # Rolling Sharpe
 rolling_sharpe = pd.Series(daily_rets).rolling(20).apply(
-    lambda x: x.mean()/x.std()*np.sqrt(252) if x.std()>0 else 0
+    lambda x: (x.mean() - 0.0425/252) / x.std() * np.sqrt(252) if x.std()>0 else 0
 )
 axes[1,0].plot(rolling_sharpe)
 axes[1,0].axhline(rolling_sharpe.mean(), color='red', ls='--')
@@ -271,7 +277,7 @@ axes[1,2].set_title('Top Ticker Exposure')
 
 plt.tight_layout()
 plt.savefig('long_short_25pct_margin.png', dpi=300, bbox_inches='tight')
-# plt.show()
+plt.show()
 
 # === SAVE ===
 results = {'returns': daily_rets.tolist(), 'metrics': metrics, 'positions': positions}

@@ -172,7 +172,7 @@ def calculate_metrics(returns):
     cumrets = (1 + clean).cumprod()
     ann_ret = (1 + clean.mean()) ** 252 - 1
     ann_vol = clean.std() * np.sqrt(252)
-    sharpe = ann_ret / ann_vol if ann_vol > 1e-8 else 0
+    sharpe = (ann_ret - 0.0425) / ann_vol if ann_vol > 1e-8 else 0
     return {
         'Total Return': cumrets.iloc[-1] - 1,
         'Ann Return': ann_ret,
