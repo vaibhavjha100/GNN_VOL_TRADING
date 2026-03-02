@@ -1,8 +1,8 @@
 """
-LONG-SHORT VOLATILITY DISPERSION BACKTEST (25%/25% QUARTILES + MARGIN)
+LONG-SHORT VOLATILITY DISPERSION BACKTEST (50%/50% QUARTILES + MARGIN)
 ✅ Matches model.py test period (2024-12+) 
 ✅ Returns from features.csv['Returns'] column
-✅ Tradeable tickers only for positions (10L/10S = 25%)
+✅ Tradeable tickers only for positions (20L/20S = 50%)
 ✅ ABSOLUTE weights sum to 1.0 (longs=0.5 + shorts=0.5 margin)
 ✅ Full return-risk metrics
 """
@@ -27,8 +27,8 @@ TRADEABLE_TICKERS = [
 ]
 
 N_TRADEABLE = len(TRADEABLE_TICKERS)
-N_LONG = int(0.5 * N_TRADEABLE)   # 10 tickers (25%)
-N_SHORT = int(0.5 * N_TRADEABLE)  # 10 tickers (25%)
+N_LONG = int(0.5 * N_TRADEABLE)   # 20 tickers (50%)
+N_SHORT = int(0.5 * N_TRADEABLE)  # 20 tickers (50%)
 
 print(f"✅ Tradeable universe: {N_TRADEABLE} tickers")
 print(f"✅ Long: {N_LONG} (50%) | Short: {N_SHORT} (50%) | ABS weights sum=1.0")
